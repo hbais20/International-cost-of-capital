@@ -40,7 +40,9 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
     ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 DEFAULT_INDUSTRY = "Software (System & Application)"
@@ -51,6 +53,7 @@ DEFAULT_DEBT = 30      # percent
 # Placeholders used ONLY if a live fetch fails and the user has not typed a value.
 # They are illustrative, not current market data.
 PLACEHOLDER = {"beta": 1.00, "tax": 25.0, "spread": 1.50, "yield": 4.00}
+US_TAX_OECD = 25.77  # OECD combined (federal + state) statutory rate, entered manually if fetch fails
 
 ALIASES = {
     "south korea": "korea", "republic of korea": "korea",
@@ -78,6 +81,14 @@ CURRENCY.update({
     "argentina": "ARS", "peru": "PEN", "russia": "RUB", "hong kong": "HKD",
     "taiwan": "TWD", "saudi arabia": "SAR", "egypt": "EGP", "nigeria": "NGN",
 })
+
+
+SLUG_OVERRIDES = {"korea": "south-korea", "turkiye": "turkey", "czechia": "czech-republic",
+                  "russia": "russia", "hong kong": "hong-kong"}
+
+
+def slug_for(key: str) -> str:
+    return SLUG_OVERRIDES.get(key, key.replace(" ", "-"))
 
 
 def norm_country(name: str) -> str:
@@ -329,6 +340,32 @@ def parse_te_yields(html: str):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def load_country_yield(key: str):
+    """Fallback when the bulk /bonds page has no rows: read one country's 10-yr page."""
+    out = {"ok": False, "data": None, "error": None, "url": None, "fetched_at": now_str()}
+    url = f"https://tradingeconomics.com/{slug_for(key)}/government-bond-yield"
+    try:
+        r = http_get(url)
+        out["url"] = url
+        out["data"] = parse_country_yield_page(r.text, key)
+        out["ok"] = True
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"{url.split('tradingeconomics.com')[-1]} -> {type(e).__name__}: {e}"
+    return out
+
+
+def parse_country_yield_page(html: str, key: str):
+    text = BeautifulSoup(html, "lxml").get_text(" ")
+    m = re.search(r"Actual\s+Previous\s+Highest\s+Lowest\s+Dates\s+Unit\s+Frequency\s+(-?\d+(?:\.\d+)?)", text)
+    if not m:
+        m = re.search(r"10[- ]?Y(?:ear)?[^%]{0,120}?\bto\s+(-?\d+(?:\.\d+)?)\s*%", text, re.I)
+    if not m:
+        raise ValueError("10-year yield not found on page")
+    d = re.search(r"\bon ([A-Z][a-z]+ \d{1,2}, \d{4})", text)
+    return {"name": key.title(), "yield": float(m.group(1)), "date": d.group(1) if d else "see page"}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_yields():
     out = {"ok": False, "data": {}, "error": None, "url": None, "fetched_at": now_str()}
     errs = []
@@ -380,8 +417,10 @@ def main():
 
     ind_list = sorted(betas["df"]["industry"].tolist()) if betas["ok"] else [DEFAULT_INDUSTRY]
     ydata = yields["data"] if yields["ok"] else {}
-    name_map = {**oecd.get("names", {}), **{k: v["name"] for k, v in ydata.items()}}
-    name_map.setdefault("united states", DEFAULT_COUNTRY)
+    name_map = {k: k.title() for k in CURRENCY}          # fallback list so the dropdown always works
+    name_map.update(oecd.get("names", {}))
+    name_map.update({k: v["name"] for k, v in ydata.items()})
+    name_map["united states"] = DEFAULT_COUNTRY
     name_to_key = {v: k for k, v in name_map.items()}
     country_list = sorted(name_to_key)
 
@@ -410,7 +449,16 @@ def main():
         beta_u, beta_src = override_input("Unlevered beta", auto_beta, f"beta_{industry}",
                                           PLACEHOLDER["beta"], 0.01, 0.0, 5.0, "%.3f")
         tax_us, tax_us_src = override_input("U.S. tax rate (%)", oecd["rates"].get("united states"),
-                                            "tax_us", PLACEHOLDER["tax"], 0.1, 0.0, 70.0)
+                                            "tax_us", US_TAX_OECD, 0.1, 0.0, 70.0)
+        def yinfo(key):
+            """Bulk page first, then the country's own page."""
+            if key in ydata:
+                return ydata[key], None
+            r = load_country_yield(key)
+            return (r["data"], None) if r["ok"] else (None, r["error"])
+
+        us_info, us_err = yinfo("united states")
+        fc_info, fc_err = (us_info, us_err) if is_us else yinfo(ckey)
         auto_tax_fc = tax_us if is_us else oecd["rates"].get(ckey)
         tax_fc, tax_fc_src = override_input(f"{country} tax rate (%)", auto_tax_fc,
                                             f"tax_fc_{ckey}_{round(tax_us, 4) if is_us else 'x'}",
@@ -418,9 +466,9 @@ def main():
         spread_usd, spread_usd_src = override_input("USD BBB spread (%)", ratings.get("spread"),
                                                     "spread_usd", PLACEHOLDER["spread"], 0.05, 0.0, 15.0)
         y_us, y_us_src = override_input("U.S. 10-yr yield (%)",
-                                        ydata.get("united states", {}).get("yield"),
+                                        us_info["yield"] if us_info else None,
                                         "y_us", PLACEHOLDER["yield"], 0.05, -1.0, 60.0)
-        auto_yfc = y_us if is_us else ydata.get(ckey, {}).get("yield")
+        auto_yfc = y_us if is_us else (fc_info["yield"] if fc_info else None)
         y_fc, y_fc_src = override_input(f"{country} 10-yr yield (%)", auto_yfc,
                                         f"y_fc_{ckey}_{round(y_us, 4) if is_us else 'x'}",
                                         PLACEHOLDER["yield"], 0.05, -1.0, 60.0)
@@ -441,7 +489,7 @@ def main():
 
     # ---------------- Warnings on failed fetches ----------------
     failed = [n for n, d_ in [("industry betas", betas), ("BBB spread", ratings),
-                              ("OECD tax rates", oecd), ("bond yields", yields)] if not d_["ok"]]
+                              ("OECD tax rates", oecd), ("bond yields", {"ok": us_info is not None and fc_info is not None})] if not d_["ok"]]
     if failed:
         st.warning("Could not fetch live data for: **" + ", ".join(failed) + "**. Enter manual values in the "
                    "sidebar (those fields were switched to manual). Press **Refresh** to retry. "
@@ -559,14 +607,14 @@ def main():
              ratings["fetched_at"], "OK" if ratings["ok"] else f"FAILED: {ratings['error']}", RATINGS_URL),
             ("U.S. tax rate", f"{tax_us:.2f}%", tax_us_src, f"OECD {oecd.get('year') or 'n/a'}",
              oecd["fetched_at"], "OK" if oecd["ok"] else f"FAILED: {oecd['error']}", OECD_URL),
-            (f"{country} tax rate", f"{tax_fc:.2f}%", tax_fc_src, f"OECD {oecd.get('year') or 'n/a'}",
+            (f"{country} tax rate", f"{tax_fc:.2f}%", ("Same as U.S." if is_us else tax_fc_src), f"OECD {oecd.get('year') or 'n/a'}",
              oecd["fetched_at"], "OK" if oecd["ok"] else f"FAILED: {oecd['error']}", OECD_URL),
             ("U.S. 10-yr yield", f"{y_us:.2f}%", y_us_src,
-             ydata.get("united states", {}).get("date", "n/a"), yields["fetched_at"],
-             "OK" if yields["ok"] else f"FAILED: {yields['error']}", yields.get("url") or TE_URL),
-            (f"{country} 10-yr yield", f"{y_fc:.2f}%", y_fc_src,
-             ydata.get(ckey, {}).get("date", "n/a"), yields["fetched_at"],
-             "OK" if yields["ok"] else f"FAILED: {yields['error']}", TE_URL),
+             us_info["date"] if us_info else "n/a", yields["fetched_at"],
+             "OK" if us_info else f"FAILED: {us_err or yields['error']}", TE_URL),
+            (f"{country} 10-yr yield", f"{y_fc:.2f}%", ("Same as U.S." if is_us else y_fc_src),
+             fc_info["date"] if fc_info else "n/a", yields["fetched_at"],
+             "OK" if fc_info else f"FAILED: {fc_err or yields['error']}", TE_URL),
         ], columns=["Item", "Value used", "Source type", "Data as-of", "Fetched at", "Status", "URL"])
         st.dataframe(src, hide_index=True,
                      column_config={"URL": st.column_config.LinkColumn("URL")})
