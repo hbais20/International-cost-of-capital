@@ -135,14 +135,15 @@ def compute_capital_costs(beta_u, tax, erp, debt_share, rf_us, rf_fc,
     kd_fc = kd_fc_auto if spread_fc is None else rf_fc + spread_fc
     wacc_fc = (1 - debt_share) * ke_fc + debt_share * kd_fc * (1 - tax)
 
+    r12 = lambda d_: {k: round(v, 12) for k, v in d_.items()}  # noqa: E731
     return {
         "de_ratio": de, "beta_levered": beta_l, "parity_factor": g,
-        "usd": {"rf": rf_us, "ke": ke_usd, "kd_pre": kd_usd,
-                "kd_post": kd_usd * (1 - tax), "wacc": wacc_usd,
-                "spread": spread_usd},
-        "fc": {"rf": rf_fc, "ke": ke_fc, "kd_pre": kd_fc,
-               "kd_post": kd_fc * (1 - tax), "wacc": wacc_fc,
-               "spread": kd_fc - rf_fc},
+        "usd": r12({"rf": rf_us, "ke": ke_usd, "kd_pre": kd_usd,
+                    "kd_post": kd_usd * (1 - tax), "wacc": wacc_usd,
+                    "spread": spread_usd}),
+        "fc": r12({"rf": rf_fc, "ke": ke_fc, "kd_pre": kd_fc,
+                   "kd_post": kd_fc * (1 - tax), "wacc": wacc_fc,
+                   "spread": kd_fc - rf_fc}),
         "spread_fc_auto": spread_fc_auto,
     }
 
@@ -205,16 +206,14 @@ def load_betas():
 
 
 def parse_bbb_spread(html: str):
-    """Find the Baa2/BBB row in the first table that has one -> spread in percent."""
-    for t in pd.read_html(StringIO(html)):
-        t = t.astype(str)
-        for _, row in t.iterrows():
-            cells = [c.strip() for c in row.tolist()]
-            if any("Baa2/BBB" in c for c in cells):
-                pct = [c for c in cells if "%" in c]
-                if pct:
-                    return float(re.search(r"-?\d+(\.\d+)?", pct[-1]).group())
-    raise ValueError("Baa2/BBB row not found on ratings page.")
+    """Baa2/BBB spread (%) for LARGE NON-FINANCIAL firms.
+    The page puts the large-firm table first and the financial-firm table to its
+    right in the same rows, so the FIRST 'Baa2/BBB <x>%' in the page text is the right one."""
+    text = BeautifulSoup(html, "lxml").get_text(" ")
+    m = re.search(r"Baa2/BBB\s+(-?\d+(?:\.\d+)?)\s*%", text)
+    if not m:
+        raise ValueError("Baa2/BBB row not found on ratings page.")
+    return float(m.group(1))
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -301,41 +300,46 @@ def load_oecd_tax():
     return out
 
 
+TE_URLS = [TE_URL,
+           "https://tradingeconomics.com/country-list/government-bond-yield",
+           "https://tradingeconomics.com/country-list/bonds"]
+
+
 def parse_te_yields(html: str):
+    """Row-based parser: first alphabetic cell = country, first number after it = yield."""
+    soup = BeautifulSoup(html, "lxml")
     result = {}
-    for t in pd.read_html(StringIO(html)):
-        ycol = next((c for c in t.columns if str(c).strip().lower() == "yield"), None)
-        if ycol is None:
+    for tr in soup.find_all("tr"):
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
+        ni = next((i for i, c in enumerate(cells)
+                   if re.fullmatch(r"[A-Za-z][A-Za-z .'\u2019&-]{2,40}", c)), None)
+        if ni is None:
             continue
-        left = [c for c in t.columns[: list(t.columns).index(ycol)]]
-        if not left:
-            continue
-        name_col = max(left, key=lambda c: t[c].astype(str).str.contains(r"[A-Za-z]{3,}").sum())
-        date_col = next((c for c in t.columns if str(c).strip().lower() == "date"), None)
-        for _, row in t.iterrows():
-            nm = str(row[name_col]).strip()
-            if not re.search(r"[A-Za-z]{3,}", nm):
-                continue
-            try:
-                y = float(str(row[ycol]).replace("%", "").strip())
-            except ValueError:
-                continue
-            result.setdefault(norm_country(nm), {
-                "name": nm, "yield": y,
-                "date": str(row[date_col]) if date_col is not None else "n/a"})
+        y, date = None, "n/a"
+        for c in cells[ni + 1:]:
+            if y is None and re.fullmatch(r"-?\d+(\.\d+)?\s*%?", c):
+                y = float(c.replace("%", ""))
+            elif re.fullmatch(r"[A-Z][a-z]{2}/\d{2}", c):
+                date = c
+        if y is not None and -1 < y < 80:
+            result.setdefault(norm_country(cells[ni]), {"name": cells[ni], "yield": y, "date": date})
     if not result:
-        raise ValueError("No yield table found on Trading Economics page.")
+        raise ValueError("No yield rows found in page.")
     return result
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_yields():
-    out = {"ok": False, "data": {}, "error": None, "fetched_at": now_str()}
-    try:
-        out["data"] = parse_te_yields(http_get(TE_URL).text)
-        out["ok"] = True
-    except Exception as e:  # noqa: BLE001
-        out["error"] = f"{type(e).__name__}: {e}"
+    out = {"ok": False, "data": {}, "error": None, "url": None, "fetched_at": now_str()}
+    errs = []
+    for url in TE_URLS:
+        try:
+            out["data"] = parse_te_yields(http_get(url).text)
+            out.update(ok=True, url=url)
+            return out
+        except Exception as e:  # noqa: BLE001
+            errs.append(f"{url.split('tradingeconomics.com')[-1] or '/'} -> {type(e).__name__}: {e}")
+    out["error"] = " | ".join(errs)
     return out
 
 
@@ -482,7 +486,10 @@ def main():
         chart = pd.DataFrame({"USD": [U["ke"] * 100, U["kd_post"] * 100, U["wacc"] * 100],
                               fc_label: [F["ke"] * 100, F["kd_post"] * 100, F["wacc"] * 100]},
                              index=["Cost of equity", "After-tax cost of debt", "WACC"])
-        st.bar_chart(chart)
+        try:
+            st.bar_chart(chart, stack=False)
+        except TypeError:
+            st.bar_chart(chart)
 
         inputs = pd.DataFrame([
             ("Industry", industry, ""),
@@ -556,7 +563,7 @@ def main():
              oecd["fetched_at"], "OK" if oecd["ok"] else f"FAILED: {oecd['error']}", OECD_URL),
             ("U.S. 10-yr yield", f"{y_us:.2f}%", y_us_src,
              ydata.get("united states", {}).get("date", "n/a"), yields["fetched_at"],
-             "OK" if yields["ok"] else f"FAILED: {yields['error']}", TE_URL),
+             "OK" if yields["ok"] else f"FAILED: {yields['error']}", yields.get("url") or TE_URL),
             (f"{country} 10-yr yield", f"{y_fc:.2f}%", y_fc_src,
              ydata.get(ckey, {}).get("date", "n/a"), yields["fetched_at"],
              "OK" if yields["ok"] else f"FAILED: {yields['error']}", TE_URL),
